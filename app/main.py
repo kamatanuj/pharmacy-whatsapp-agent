@@ -7,9 +7,36 @@ import os
 import json
 import logging
 import requests
+import threading
+from collections import defaultdict
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
+
+# --- Deduplication + per-user locking ---
+_processed_msg_ids = set()
+_processed_msg_lock = threading.Lock()
+_user_locks = defaultdict(threading.Lock)
+_user_locks_guard = threading.Lock()
+
+def _get_user_lock(phone: str) -> threading.Lock:
+    """Get or create a per-user lock to serialize message processing."""
+    with _user_locks_guard:
+        return _user_locks[phone]
+
+MAX_PROCESSED_IDS = 500  # Keep memory bounded
+
+def _is_duplicate(msg_id: str) -> bool:
+    """Check if we've already processed this message ID."""
+    with _processed_msg_lock:
+        if msg_id in _processed_msg_ids:
+            return True
+        _processed_msg_ids.add(msg_id)
+        # Trim if too large
+        if len(_processed_msg_ids) > MAX_PROCESSED_IDS:
+            _processed_msg_ids.clear()
+            _processed_msg_ids.add(msg_id)
+        return False
 
 # Load environment
 load_dotenv()
@@ -228,103 +255,113 @@ async def receive_webhook(request: Request) -> JSONResponse:
         msg_type = msg.get("type", "")
         msg_id = msg.get("id", "")
 
+        # --- Deduplication: skip already-processed messages ---
+        if msg_id and _is_duplicate(msg_id):
+            logger.info(f"Duplicate webhook skipped: msg_id={msg_id}, from={sender_phone}")
+            return JSONResponse(content={"status": "ok"}, status_code=200)
+
         # Mark message as read
         if msg_id:
             mark_message_read(msg_id)
 
+        # --- Per-user lock: serialize messages from same user ---
+        user_lock = _get_user_lock(sender_phone)
+
         # --- Handle Image (prescription) ---
         if msg_type == "image":
-            image_info = msg.get("image", {})
-            media_id = image_info.get("id", "")
+            with user_lock:
+                image_info = msg.get("image", {})
+                media_id = image_info.get("id", "")
 
-            logger.info(f"Image received from {sender_phone}, media_id={media_id}")
+                logger.info(f"Image received from {sender_phone}, media_id={media_id}")
 
-            # Download prescription image
-            from tools.pharmacy_tools import download_prescription_image
-            result = download_prescription_image(media_id)
+                # Download prescription image
+                from tools.pharmacy_tools import download_prescription_image
+                result = download_prescription_image(media_id)
 
-            if result.get("success"):
-                send_whatsapp_message(
-                    sender_phone,
-                    "✅ Prescription received! Our pharmacist will review it shortly. "
-                    "We'll notify you once it's verified.",
-                )
-            else:
-                send_whatsapp_message(
-                    sender_phone,
-                    "⚠️ We received your prescription image but had trouble processing it. "
-                    "Please try sending it again, or call us directly.",
-                )
+                if result.get("success"):
+                    send_whatsapp_message(
+                        sender_phone,
+                        "✅ Prescription received! Our pharmacist will review it shortly. "
+                        "We'll notify you once it's verified.",
+                    )
+                else:
+                    send_whatsapp_message(
+                        sender_phone,
+                        "⚠️ We received your prescription image but had trouble processing it. "
+                        "Please try sending it again, or call us directly.",
+                    )
 
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
         # --- Handle Audio (voice message) ---
         if msg_type == "audio":
-            audio_info = msg.get("audio", {})
-            media_id = audio_info.get("id", "")
-            # Note: WhatsApp voice messages are audio/ogg with Opus codec
+            with user_lock:
+                audio_info = msg.get("audio", {})
+                media_id = audio_info.get("id", "")
+                # Note: WhatsApp voice messages are audio/ogg with Opus codec
 
-            logger.info(f"Voice message from {sender_phone}, media_id={media_id}")
+                logger.info(f"Voice message from {sender_phone}, media_id={media_id}")
 
-            # Download the audio file from WhatsApp
-            audio_path = download_whatsapp_media(media_id, META_ACCESS_TOKEN)
+                # Download the audio file from WhatsApp
+                audio_path = download_whatsapp_media(media_id, META_ACCESS_TOKEN)
 
-            if not audio_path:
-                send_whatsapp_message(
-                    sender_phone,
-                    "⚠️ I couldn't download your voice message. Please try sending it again, or type your message.",
-                )
-                return JSONResponse(content={"status": "ok"}, status_code=200)
-
-            try:
-                # Transcribe audio to text
-                transcribed_text = transcribe_audio(audio_path)
-
-                # Clean up downloaded file
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
-
-                if not transcribed_text:
+                if not audio_path:
                     send_whatsapp_message(
                         sender_phone,
-                        "⚠️ I couldn't understand your voice message. Could you please type your message instead?",
+                        "⚠️ I couldn't download your voice message. Please try sending it again, or type your message.",
                     )
                     return JSONResponse(content={"status": "ok"}, status_code=200)
 
-                logger.info(f"Transcribed voice from {sender_phone}: {transcribed_text[:100]}")
-
-                # Run LLM cycle with transcribed text
-                reply = run_llm_cycle(sender_phone, transcribed_text)
-
-                # Send text reply
-                send_whatsapp_message(sender_phone, reply)
-
-                # Also send voice reply (TTS)
                 try:
-                    mp3_path = generate_speech(reply, language="en")
-                    if mp3_path:
-                        ogg_path = convert_mp3_to_ogg(mp3_path)
-                        if ogg_path:
-                            wa_media_id = upload_whatsapp_media(ogg_path, mime_type="audio/ogg")
-                            if wa_media_id:
-                                send_whatsapp_audio(sender_phone, wa_media_id)
-                            # Clean up temp files
-                            for p in [mp3_path, ogg_path]:
-                                try:
-                                    os.remove(p)
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.error(f"TTS/voice reply error: {e}")
+                    # Transcribe audio to text
+                    transcribed_text = transcribe_audio(audio_path)
 
-            except Exception as e:
-                logger.error(f"Audio processing error: {e}", exc_info=True)
-                send_whatsapp_message(
-                    sender_phone,
-                    "I had trouble processing your voice message. Please try typing instead. 🙏",
-                )
+                    # Clean up downloaded file
+                    try:
+                        os.remove(audio_path)
+                    except Exception:
+                        pass
+
+                    if not transcribed_text:
+                        send_whatsapp_message(
+                            sender_phone,
+                            "⚠️ I couldn't understand your voice message. Could you please type your message instead?",
+                        )
+                        return JSONResponse(content={"status": "ok"}, status_code=200)
+
+                    logger.info(f"Transcribed voice from {sender_phone}: {transcribed_text[:100]}")
+
+                    # Run LLM cycle with transcribed text
+                    reply = run_llm_cycle(sender_phone, transcribed_text)
+
+                    # Send text reply
+                    send_whatsapp_message(sender_phone, reply)
+
+                    # Also send voice reply (TTS)
+                    try:
+                        mp3_path = generate_speech(reply, language="en")
+                        if mp3_path:
+                            ogg_path = convert_mp3_to_ogg(mp3_path)
+                            if ogg_path:
+                                wa_media_id = upload_whatsapp_media(ogg_path, mime_type="audio/ogg")
+                                if wa_media_id:
+                                    send_whatsapp_audio(sender_phone, wa_media_id)
+                                # Clean up temp files
+                                for p in [mp3_path, ogg_path]:
+                                    try:
+                                        os.remove(p)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        logger.error(f"TTS/voice reply error: {e}")
+
+                except Exception as e:
+                    logger.error(f"Audio processing error: {e}", exc_info=True)
+                    send_whatsapp_message(
+                        sender_phone,
+                        "I had trouble processing your voice message. Please try typing instead. 🙏",
+                    )
 
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
@@ -342,35 +379,36 @@ async def receive_webhook(request: Request) -> JSONResponse:
                 )
                 return JSONResponse(content={"status": "ok"}, status_code=200)
 
-            # Run LLM cycle
-            try:
-                reply = run_llm_cycle(sender_phone, text_body)
-                send_whatsapp_message(sender_phone, reply)
-
-                # Also send voice reply (TTS)
+            # Run LLM cycle (with per-user lock to prevent parallel processing)
+            with user_lock:
                 try:
-                    mp3_path = generate_speech(reply, language="en")
-                    if mp3_path:
-                        ogg_path = convert_mp3_to_ogg(mp3_path)
-                        if ogg_path:
-                            wa_media_id = upload_whatsapp_media(ogg_path, mime_type="audio/ogg")
-                            if wa_media_id:
-                                send_whatsapp_audio(sender_phone, wa_media_id)
-                            # Clean up temp files
-                            for p in [mp3_path, ogg_path]:
-                                try:
-                                    os.remove(p)
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.error(f"TTS/voice reply error: {e}")
+                    reply = run_llm_cycle(sender_phone, text_body)
+                    send_whatsapp_message(sender_phone, reply)
 
-            except Exception as e:
-                logger.error(f"LLM cycle error: {e}", exc_info=True)
-                send_whatsapp_message(
-                    sender_phone,
-                    "I'm sorry, I'm having trouble right now. Please try again in a moment. 🙏",
-                )
+                    # Also send voice reply (TTS)
+                    try:
+                        mp3_path = generate_speech(reply, language="en")
+                        if mp3_path:
+                            ogg_path = convert_mp3_to_ogg(mp3_path)
+                            if ogg_path:
+                                wa_media_id = upload_whatsapp_media(ogg_path, mime_type="audio/ogg")
+                                if wa_media_id:
+                                    send_whatsapp_audio(sender_phone, wa_media_id)
+                                # Clean up temp files
+                                for p in [mp3_path, ogg_path]:
+                                    try:
+                                        os.remove(p)
+                                    except Exception:
+                                        pass
+                    except Exception as e:
+                        logger.error(f"TTS/voice reply error: {e}")
+
+                except Exception as e:
+                    logger.error(f"LLM cycle error: {e}", exc_info=True)
+                    send_whatsapp_message(
+                        sender_phone,
+                        "I'm sorry, I'm having trouble right now. Please try again in a moment. 🙏",
+                    )
 
             return JSONResponse(content={"status": "ok"}, status_code=200)
 
