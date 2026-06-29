@@ -81,10 +81,13 @@ def run_llm_cycle(phone_number: str, user_message: str) -> str:
     tool_calls = msg.get("tool_calls")
     content = msg.get("content", "")
 
-    # 5. Handle tool calls
+    # 5. Handle tool calls (max 2 calls per tool per cycle to prevent loops)
     if tool_calls:
         # Append assistant message with tool_calls to messages
         messages.append(msg)
+
+        # Track how many times each tool has been called in this cycle
+        tool_call_counts = {}
 
         for tc in tool_calls:
             func_name = tc["function"]["name"]
@@ -94,13 +97,25 @@ def run_llm_cycle(phone_number: str, user_message: str) -> str:
             if func_name == "create_pharmacy_order":
                 func_args["phone_number"] = phone_number
 
-            logger.info(f"Tool call: {func_name}({func_args})")
-
-            # Execute tool
-            if func_name in AVAILABLE_TOOLS:
-                result = AVAILABLE_TOOLS[func_name](**func_args)
+            # --- Retry cap: max 2 calls per tool per cycle ---
+            tool_call_counts[func_name] = tool_call_counts.get(func_name, 0) + 1
+            if tool_call_counts[func_name] > 2:
+                logger.warning(f"Tool {func_name} called {tool_call_counts[func_name]} times — capping at 2, returning fallback")
+                result = {
+                    "order_id": func_args.get("order_id", "N/A"),
+                    "status": "Not Found",
+                    "estimated_delivery": "N/A",
+                    "_retry_exceeded": True,
+                    "message": f"Order {func_args.get('order_id', '')} could not be found after multiple attempts. Please check the order ID and try again.",
+                }
             else:
-                result = {"error": f"Unknown tool: {func_name}"}
+                logger.info(f"Tool call #{tool_call_counts[func_name]}: {func_name}({func_args})")
+
+                # Execute tool
+                if func_name in AVAILABLE_TOOLS:
+                    result = AVAILABLE_TOOLS[func_name](**func_args)
+                else:
+                    result = {"error": f"Unknown tool: {func_name}"}
 
             logger.info(f"Tool result: {result}")
 
