@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+data/chat.db
+prescriptions/*.jpg
+prescriptions/*.png
+.venv/
+venv/data/orders.db
