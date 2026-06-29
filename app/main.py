@@ -32,7 +32,13 @@ from tools.schema import TOOLS_SCHEMA
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "")
 META_VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "healthfirst_whatsapp_verify_2026")
 OLLAMA_CLOUD_API_KEY = os.getenv("OLLAMA_CLOUD_API_KEY", "")
-OLLAMA_API_URL = "https://ollama.com/v1/chat/completions"
+
+# LLM config — switch between local Ollama and Ollama Cloud via env vars
+# Local mode (free, dev):  LLM_MODEL=ornith:9b, LLM_API_URL=http://localhost:11434/v1/chat/completions
+# Cloud mode (production): LLM_MODEL=glm-5.2:cloud, LLM_API_URL=https://ollama.com/v1/chat/completions
+LLM_MODEL = os.getenv("LLM_MODEL", "glm-5.2:cloud")
+LLM_API_URL = os.getenv("LLM_API_URL", "https://ollama.com/v1/chat/completions")
+LLM_IS_LOCAL = "localhost" in LLM_API_URL or "127.0.0.1" in LLM_API_URL
 
 # Initialize SQLite
 init_db()
@@ -144,9 +150,9 @@ def run_llm_cycle(phone_number: str, user_message: str) -> str:
 
 
 def _call_llm(messages: list, tools: list = None) -> dict:
-    """Call GLM 5.2 via Ollama Cloud API."""
+    """Call LLM via Ollama API (local or cloud)."""
     payload = {
-        "model": "glm-5.2:cloud",
+        "model": LLM_MODEL,
         "messages": messages,
         "max_tokens": 1000,
         "temperature": 0.7,
@@ -154,15 +160,20 @@ def _call_llm(messages: list, tools: list = None) -> dict:
     if tools:
         payload["tools"] = tools
 
+    # Build headers — local Ollama doesn't need auth
+    headers = {"Content-Type": "application/json"}
+    if not LLM_IS_LOCAL and OLLAMA_CLOUD_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_CLOUD_API_KEY}"
+
+    # Local Ollama is slower (CPU), give it more time
+    timeout = 180 if LLM_IS_LOCAL else 90
+
     try:
         resp = requests.post(
-            OLLAMA_API_URL,
-            headers={
-                "Authorization": f"Bearer {OLLAMA_CLOUD_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            LLM_API_URL,
+            headers=headers,
             json=payload,
-            timeout=90,
+            timeout=timeout,
         )
         resp.raise_for_status()
         return resp.json()
@@ -383,7 +394,8 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "Pharmacy WhatsApp AI Agent",
-        "model": "glm-5.2:cloud",
+        "model": LLM_MODEL,
+        "mode": "local" if LLM_IS_LOCAL else "cloud",
         "version": "1.0.0",
     }
 
